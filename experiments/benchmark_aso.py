@@ -30,6 +30,16 @@ from sklearn.model_selection import KFold
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# Load .env file from project root if it exists
+_env_file = PROJECT_ROOT / ".env"
+if _env_file.is_file():
+    with open(_env_file) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _key, _val = _line.split("=", 1)
+                os.environ.setdefault(_key.strip(), _val.strip())
+
 from oligogym.data import DatasetDownloader
 from oligogym.features import KMersCounts, OneHotEncoder, ModelGeneratorEmbeddings
 from oligogym.metrics import regression_metrics
@@ -54,6 +64,11 @@ RANDOM_STATE = 42
 RESULTS_DIR = PROJECT_ROOT / "experiments" / "results"
 EMBEDDING_CACHE_DIR = str(PROJECT_ROOT / "experiments" / "embeddings_cache")
 EMBEDDING_BACKBONE = "aido_rna_650m"
+
+# NCBI Entrez config for auto-downloading missing gene transcripts.
+# Set your email here or via the NCBI_EMAIL environment variable.
+NCBI_EMAIL = "your.email@example.com"  # <-- CHANGE THIS or set NCBI_EMAIL env var
+NCBI_API_KEY = None  # optional, raises NCBI rate limit to 10 req/s
 
 # Featurizer configs
 FEAT_CONFIGS = {
@@ -279,32 +294,41 @@ def main():
         if missing_genes:
             log(f"{'='*70}", report)
             log(f"  Gene Transcript Check: {len(existing_genes)} found, "
-                f"{len(missing_genes)} missing", report)
+                f"{len(missing_genes)} MISSING in {ref_dir}", report)
             log(f"{'='*70}", report)
-            for g in missing_genes:
-                log(f"    [MISSING] {g}.fna", report)
 
-            ncbi_email = os.environ.get("NCBI_EMAIL")
-            ncbi_api_key = os.environ.get("NCBI_API_KEY")
+            # Resolve email: config constant > env var
+            ncbi_email = os.environ.get("NCBI_EMAIL") or NCBI_EMAIL
+            ncbi_api_key = os.environ.get("NCBI_API_KEY") or NCBI_API_KEY
 
-            if not ncbi_email:
+            if not ncbi_email or ncbi_email == "your.email@example.com":
                 log("", report)
-                log("  *** NCBI_EMAIL env var not set — cannot download. ***", report)
-                log("  Set it with: export NCBI_EMAIL=your.email@example.com", report)
-                log("  Without gene files, ALL target features will be constant", report)
-                log("  (NaN/zero), making target feature experiments meaningless.", report)
+                log("  !!! CANNOT DOWNLOAD — no valid NCBI email configured !!!", report)
+                log("  Fix: set NCBI_EMAIL in the Configuration section of this script,", report)
+                log("       or export NCBI_EMAIL=you@example.com in your shell.", report)
+                log("", report)
+                log("  Without gene transcript files, ALL target feature experiments", report)
+                log("  will produce identical results (features are constant 0/NaN).", report)
             else:
-                log(f"\n  Downloading via NCBI Entrez (email: {ncbi_email})...", report)
+                log(f"\n  Downloading {len(missing_genes)} gene transcripts "
+                    f"via NCBI Entrez...", report)
+                log(f"  Email: {ncbi_email}", report)
+                log(f"  Output dir: {ref_dir}", report)
+                log("", report)
+
                 downloader_ncbi = NCBIGeneDownloader(
                     email=ncbi_email,
                     output_dir=ref_dir,
                     api_key=ncbi_api_key,
                 )
-                results = downloader_ncbi.process_genes(missing_genes)
-                downloaded = [g for g, p in results.items() if p is not None]
-                failed = [g for g, p in results.items() if p is None]
-                log(f"\n  Download complete: {len(downloaded)}/{len(missing_genes)} "
-                    f"succeeded", report)
+                dl_results = downloader_ncbi.process_genes(missing_genes)
+                downloaded = [g for g, p in dl_results.items() if p is not None]
+                failed = [g for g, p in dl_results.items() if p is None]
+
+                log(f"\n  {'='*50}", report)
+                log(f"  Download summary: {len(downloaded)} OK, "
+                    f"{len(failed)} failed out of {len(missing_genes)}", report)
+                log(f"  {'='*50}", report)
                 for g in downloaded:
                     log(f"    [OK]     {g}.fna", report)
                 for g in failed:
