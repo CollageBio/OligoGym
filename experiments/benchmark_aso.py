@@ -35,9 +35,8 @@ from oligogym.features import KMersCounts, OneHotEncoder, ModelGeneratorEmbeddin
 from oligogym.metrics import regression_metrics
 from oligogym.models import (
     LinearModel,
-    NearestNeighborsModel,
-    RandomForestModel,
     XGBoostModel,
+    CatBoostModel,
 )
 from oligogym.target_features import TargetFeatures, TargetContextEncoder
 
@@ -47,7 +46,7 @@ logging.basicConfig(level=logging.INFO, format="%(name)s — %(message)s")
 # =============================================================================
 # Configuration
 # =============================================================================
-MODELS_TO_RUN = ["Linear", "KNN", "RF", "XGB"]
+MODELS_TO_RUN = ["Linear", "XGB", "CatBoost"]
 ASO_DATASET_KEYS = ["OpenASO", "ASOptimizer"]
 N_FOLDS = 5
 RANDOM_STATE = 42
@@ -68,33 +67,30 @@ FEAT_CONFIGS = {
 
 MODEL_CLASSES = {
     "Linear": LinearModel,
-    "KNN": NearestNeighborsModel,
-    "RF": RandomForestModel,
     "XGB": XGBoostModel,
+    "CatBoost": CatBoostModel,
 }
 
 # Paper Table 2: best PCC per model (random 5-fold CV)
+# CatBoost was not in the original paper — no paper reference available
 PAPER_RESULTS = {
     "OpenASO": {
-        "Linear": (0.33, 0.02), "KNN": (0.32, 0.01),
-        "RF": (0.35, 0.04), "XGB": (0.27, 0.02),
+        "Linear": (0.33, 0.02), "XGB": (0.27, 0.02),
     },
     "ASOptimizer": {
-        "Linear": (0.47, 0.01), "KNN": (0.63, 0.01),
-        "RF": (0.64, 0.01), "XGB": (0.58, 0.01),
+        "Linear": (0.47, 0.01), "XGB": (0.58, 0.01),
     },
 }
 
 # Best configs from paper appendix Tables A5-A8 (Random split column)
+# CatBoost configs chosen to mirror XGBoost featurizer + comparable tree params
 BEST_CONFIGS = {
-    ("OpenASO",      "Linear"): ("kmer_12_nomod",  {"task": "regression", "type": "standard"}),
-    ("ASOptimizer",  "Linear"): ("ohe_full",       {"task": "regression", "type": "ridge"}),
-    ("OpenASO",      "KNN"): ("kmer_123_mod", {"task": "regression", "n_neighbors": 10}),
-    ("ASOptimizer",  "KNN"): ("kmer_123_mod", {"task": "regression", "n_neighbors": 10}),
-    ("OpenASO",      "RF"): ("kmer_123_mod", {"task": "regression", "n_estimators": 500,  "max_depth": 10}),
-    ("ASOptimizer",  "RF"): ("kmer_123_mod", {"task": "regression", "n_estimators": 500,  "max_depth": 20}),
-    ("OpenASO",      "XGB"): ("kmer_12_nomod", {"task": "regression", "n_estimators": 1000, "max_depth": 10}),
-    ("ASOptimizer",  "XGB"): ("kmer_123_mod",  {"task": "regression", "n_estimators": 100,  "max_depth": 10}),
+    ("OpenASO",      "Linear"):   ("kmer_12_nomod",  {"task": "regression", "type": "standard"}),
+    ("ASOptimizer",  "Linear"):   ("ohe_full",       {"task": "regression", "type": "ridge"}),
+    ("OpenASO",      "XGB"):      ("kmer_12_nomod",  {"task": "regression", "n_estimators": 1000, "max_depth": 10}),
+    ("ASOptimizer",  "XGB"):      ("kmer_123_mod",   {"task": "regression", "n_estimators": 100,  "max_depth": 10}),
+    ("OpenASO",      "CatBoost"): ("kmer_12_nomod",  {"task": "regression", "iterations": 1000, "depth": 10}),
+    ("ASOptimizer",  "CatBoost"): ("kmer_123_mod",   {"task": "regression", "iterations": 100,  "depth": 10}),
 }
 
 VARIANT_NAMES = [
@@ -237,11 +233,18 @@ def main():
                 mean_pcc, std_pcc = run_cv(model_class, model_kwargs, X_feat, y_all)
                 baseline_results[(ds_key, model_name)] = (mean_pcc, std_pcc)
 
-                paper_mean, paper_std = PAPER_RESULTS[ds_key][model_name]
-                delta = mean_pcc - paper_mean
-                log(f"    {model_name:8s} [{feat_key:15s}]: "
-                    f"PCC = {mean_pcc:.3f} +/- {std_pcc:.3f}  "
-                    f"(paper: {paper_mean:.2f}, delta = {delta:+.3f})", report)
+                paper_ref = PAPER_RESULTS.get(ds_key, {}).get(model_name)
+                if paper_ref:
+                    paper_mean, paper_std = paper_ref
+                    delta = mean_pcc - paper_mean
+                    log(f"    {model_name:8s} [{feat_key:15s}]: "
+                        f"PCC = {mean_pcc:.3f} +/- {std_pcc:.3f}  "
+                        f"(paper: {paper_mean:.2f}, delta = {delta:+.3f})", report)
+                else:
+                    paper_mean, paper_std, delta = np.nan, np.nan, np.nan
+                    log(f"    {model_name:8s} [{feat_key:15s}]: "
+                        f"PCC = {mean_pcc:.3f} +/- {std_pcc:.3f}  "
+                        f"(no paper reference)", report)
 
                 baseline_rows.append({
                     "dataset": ds_key,
@@ -251,7 +254,7 @@ def main():
                     "pcc_std": round(std_pcc, 4),
                     "paper_pcc_mean": paper_mean,
                     "paper_pcc_std": paper_std,
-                    "delta_vs_paper": round(delta, 4),
+                    "delta_vs_paper": round(delta, 4) if not np.isnan(delta) else np.nan,
                 })
 
         df_baseline = pd.DataFrame(baseline_rows)
@@ -383,7 +386,10 @@ def main():
                     log(f"      {variant_name:18s} ({X_feat.shape[1]:4d} feats): "
                         f"PCC = {mean_pcc:.3f} +/- {std_pcc:.3f}{marker}", report)
 
-                    paper_mean, paper_std = PAPER_RESULTS[ds_key][model_name]
+                    paper_ref = PAPER_RESULTS.get(ds_key, {}).get(model_name)
+                    paper_mean = paper_ref[0] if paper_ref else np.nan
+                    paper_std = paper_ref[1] if paper_ref else np.nan
+                    delta = round(mean_pcc - paper_mean, 4) if paper_ref else np.nan
                     target_rows.append({
                         "dataset": ds_key,
                         "model": model_name,
@@ -394,7 +400,7 @@ def main():
                         "pcc_std": round(std_pcc, 4),
                         "paper_pcc_mean": paper_mean,
                         "paper_pcc_std": paper_std,
-                        "delta_vs_paper": round(mean_pcc - paper_mean, 4),
+                        "delta_vs_paper": delta,
                         "target_coverage": round(tf_data["coverage"], 3),
                     })
 
@@ -445,7 +451,10 @@ def main():
                     log(f"      {variant_name:24s} ({X_feat.shape[1]:4d} feats): "
                         f"PCC = {mean_pcc:.3f} +/- {std_pcc:.3f}", report)
 
-                    paper_mean, paper_std = PAPER_RESULTS[ds_key][model_name]
+                    paper_ref = PAPER_RESULTS.get(ds_key, {}).get(model_name)
+                    paper_mean = paper_ref[0] if paper_ref else np.nan
+                    paper_std = paper_ref[1] if paper_ref else np.nan
+                    delta = round(mean_pcc - paper_mean, 4) if paper_ref else np.nan
                     embed_rows.append({
                         "dataset": ds_key,
                         "model": model_name,
@@ -456,7 +465,7 @@ def main():
                         "pcc_std": round(std_pcc, 4),
                         "paper_pcc_mean": paper_mean,
                         "paper_pcc_std": paper_std,
-                        "delta_vs_paper": round(mean_pcc - paper_mean, 4),
+                        "delta_vs_paper": delta,
                         "target_coverage": round(tf_data["coverage"], 3),
                     })
 
@@ -529,8 +538,16 @@ def main():
         log(f"  {'-'*105}", report)
 
         for ds_key in ASO_DATASET_KEYS:
-            paper_best_model = max(MODELS_TO_RUN, key=lambda m: PAPER_RESULTS[ds_key][m][0])
-            paper_best_mean, paper_best_std = PAPER_RESULTS[ds_key][paper_best_model]
+            # Paper best (only models that have paper references)
+            models_with_paper = [m for m in MODELS_TO_RUN if m in PAPER_RESULTS.get(ds_key, {})]
+            if models_with_paper:
+                paper_best_model = max(models_with_paper, key=lambda m: PAPER_RESULTS[ds_key][m][0])
+                paper_best_mean, paper_best_std = PAPER_RESULTS[ds_key][paper_best_model]
+                paper_str = (f"{paper_best_mean:.2f} +/- {paper_best_std:.2f} "
+                             f"({paper_best_model:6s})")
+            else:
+                paper_best_mean = np.nan
+                paper_str = "N/A"
 
             bl_best_model = max(MODELS_TO_RUN,
                                 key=lambda m: all_results[(ds_key, m, "Baseline")][0])
@@ -544,10 +561,10 @@ def main():
             best_model = best_key[1]
             best_variant = best_key[2]
 
-            log(f"  {ds_key:15s} | {paper_best_mean:.2f} +/- {paper_best_std:.2f} "
-                f"({paper_best_model:6s}) | {bl_best_mean:.3f} +/- {bl_best_std:.3f} "
+            impr_str = f"{best_mean - paper_best_mean:+.3f}" if not np.isnan(paper_best_mean) else "N/A"
+            log(f"  {ds_key:15s} | {paper_str:22s} | {bl_best_mean:.3f} +/- {bl_best_std:.3f} "
                 f"({bl_best_model:6s}) | {best_mean:.3f} +/- {best_std:.3f} "
-                f"({best_model} {best_variant}) | {best_mean - paper_best_mean:+.3f}", report)
+                f"({best_model} {best_variant}) | {impr_str}", report)
 
         # Variant win counts (across ALL variants)
         log(f"\n  Best variant wins (across all dataset x model combos):", report)
