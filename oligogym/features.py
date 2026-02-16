@@ -1007,7 +1007,6 @@ class RNAFMEmbeddings:
             monomers["base"] = monomers["base"].replace("EMPTY", "")
             monomers["base"] = monomers["base"].str[-1]
             fasta_str = monomers["base"].str.cat()
-            fasta_str = fasta_str.replace("T", "U")
             return fasta_str
         except Exception as e:
             warnings.warn(f"Could not convert HELM to FASTA: {e}")
@@ -1099,17 +1098,15 @@ class RNAFMEmbeddings:
             oligo_list (List[str]): List of oligo sequences in HELM notation
                 (or FASTA/DNA strings when ``input_format="fasta"``).
             input_format (str): ``"helm"`` (default) or ``"fasta"``. When
-                ``"fasta"``, inputs are treated as raw DNA/RNA strings
-                (T is converted to U automatically).
+                ``"fasta"``, inputs are treated as raw DNA/RNA strings.
 
         Returns:
             Union[np.ndarray, pd.DataFrame]: If flatten=False, returns numpy array with shape
                                            (n_samples, max_seq_len, embedding_dim).
                                            If flatten=True, returns DataFrame with pooled embeddings.
         """
-        # Convert to FASTA (RNA alphabet)
         if input_format == "fasta":
-            fasta_sequences = [seq.replace("T", "U") for seq in oligo_list]
+            fasta_sequences = list(oligo_list)
         else:
             fasta_sequences = [self._helm_to_fasta(oligo) for oligo in oligo_list]
         
@@ -1235,7 +1232,6 @@ class ModelGeneratorEmbeddings:
             monomers["base"] = monomers["base"].replace("EMPTY", "")
             monomers["base"] = monomers["base"].str[-1]
             fasta_str = monomers["base"].str.cat()
-            fasta_str = fasta_str.replace("T", "U")
             return fasta_str
         except Exception as e:
             warnings.warn(f"Could not convert HELM to FASTA: {e}")
@@ -1285,11 +1281,10 @@ class ModelGeneratorEmbeddings:
             oligo_list: HELM strings, or FASTA/DNA strings when
                 ``input_format="fasta"``.
             input_format: ``"helm"`` (default) or ``"fasta"``. When
-                ``"fasta"``, inputs are treated as raw DNA/RNA strings
-                (T is converted to U automatically).
+                ``"fasta"``, inputs are treated as raw DNA/RNA strings.
         """
         if input_format == "fasta":
-            fasta_sequences = [seq.replace("T", "U") for seq in oligo_list]
+            fasta_sequences = list(oligo_list)
         else:
             fasta_sequences = [self._helm_to_fasta(oligo) for oligo in oligo_list]
 

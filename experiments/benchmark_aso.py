@@ -104,13 +104,12 @@ BEST_CONFIGS = {
 }
 
 VARIANT_NAMES = [
-    "Baseline", "+ TF", "+ CtxKmer", "+ CtxOH", "+ CtxEmbed",
-    "+ TF + CtxKmer", "+ TF + CtxOH", "+ TF + CtxEmbed",
+    "Baseline", "+ TF", "+ CtxKmer", "+ CtxEmbed",
+    "+ TF + CtxKmer", "+ TF + CtxEmbed",
 ]
 
 EMBED_VARIANT_NAMES = [
-    "Embed", "Embed + TF", "Embed + CtxKmer", "Embed + CtxOH", "Embed + CtxEmbed",
-    "Embed + TF + CtxEmbed",
+    "Embed", "Embed + TF", "Embed + CtxKmer", "Embed + CtxEmbed",
 ]
 
 ALL_VARIANT_NAMES = VARIANT_NAMES + EMBED_VARIANT_NAMES
@@ -364,17 +363,9 @@ def main():
             X_ctx_kmer = tce_kmer.fit_transform(data.x, targets=data.targets)
             log(f"    CtxKmer: {X_ctx_kmer.shape}", report)
 
-            tce_oh = TargetContextEncoder(
-                reference_dir=ref_dir, context_window=50,
-                encoding="onehot", pooling="mean",
-            )
-            X_ctx_oh = tce_oh.fit_transform(data.x, targets=data.targets)
-            log(f"    CtxOH:   {X_ctx_oh.shape}", report)
-
             dataset_target_feats[ds_key] = {
                 "TF": X_tf.fillna(-1),
                 "CtxKmer": X_ctx_kmer,
-                "CtxOH": X_ctx_oh,
                 "coverage": coverage,
             }
 
@@ -431,7 +422,6 @@ def main():
             tf_data = dataset_target_feats[ds_key]
             X_tf = tf_data["TF"]
             X_ctx_kmer = tf_data["CtxKmer"]
-            X_ctx_oh = tf_data["CtxOH"]
             X_ctx_embed = tf_data["CtxEmbed"]
 
             log(f"\n  {ds_key} (coverage: {tf_data['coverage']:.1%})", report)
@@ -446,10 +436,8 @@ def main():
                     "Baseline":       X_base,
                     "+ TF":           combine_features(X_base, X_tf),
                     "+ CtxKmer":      combine_features(X_base, X_ctx_kmer),
-                    "+ CtxOH":        combine_features(X_base, X_ctx_oh),
                     "+ CtxEmbed":     combine_features(X_base, X_ctx_embed),
                     "+ TF + CtxKmer": combine_features(X_base, X_tf, X_ctx_kmer),
-                    "+ TF + CtxOH":   combine_features(X_base, X_tf, X_ctx_oh),
                     "+ TF + CtxEmbed": combine_features(X_base, X_tf, X_ctx_embed),
                 }
 
@@ -497,7 +485,6 @@ def main():
             tf_data = dataset_target_feats[ds_key]
             X_tf = tf_data["TF"]
             X_ctx_kmer = tf_data["CtxKmer"]
-            X_ctx_oh = tf_data["CtxOH"]
             X_ctx_embed = tf_data["CtxEmbed"]
             X_embed = dataset_features[(ds_key, "rna_embed")]
 
@@ -512,9 +499,7 @@ def main():
                     "Embed":              X_embed,
                     "Embed + TF":         combine_features(X_embed, X_tf),
                     "Embed + CtxKmer":    combine_features(X_embed, X_ctx_kmer),
-                    "Embed + CtxOH":      combine_features(X_embed, X_ctx_oh),
                     "Embed + CtxEmbed":   combine_features(X_embed, X_ctx_embed),
-                    "Embed + TF + CtxEmbed": combine_features(X_embed, X_tf, X_ctx_embed),
                 }
 
                 log(f"\n    {model_name} (rna_embed):", report)
