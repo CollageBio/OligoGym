@@ -66,7 +66,10 @@ RESULTS_DIR = PROJECT_ROOT / "experiments" / "results"
 EMBEDDING_CACHE_DIR = str(PROJECT_ROOT / "experiments" / "embeddings_cache")
 EMBEDDING_BACKBONE = "aido_rna_650m"
 EMBEDDING_PCA = True       # Apply PCA to RNA embeddings (set False to use full dims)
-EMBEDDING_PCA_DIMS = 100   # Number of PCA components when EMBEDDING_PCA is True
+EMBEDDING_PCA_DIMS = {     # Per-dataset PCA components when EMBEDDING_PCA is True
+    "OpenASO": 128,
+    "ASOptimizer": 256,
+}
 
 # NCBI Entrez config for auto-downloading missing gene transcripts.
 # Set your email here or via the NCBI_EMAIL environment variable.
@@ -445,7 +448,7 @@ def main():
         # -----------------------------------------------------------------
         # Compute RNA embeddings (ASO sequences + target context)
         # -----------------------------------------------------------------
-        pca_label = f", PCA→{EMBEDDING_PCA_DIMS}" if EMBEDDING_PCA else ""
+        pca_label = (f", PCA→{EMBEDDING_PCA_DIMS}") if EMBEDDING_PCA else ""
         log(f"{'='*70}", report)
         log(f"  Computing RNA Embeddings ({EMBEDDING_BACKBONE}{pca_label})", report)
         log(f"{'='*70}", report)
@@ -476,7 +479,8 @@ def main():
 
             # Optional per-dataset PCA reduction
             if EMBEDDING_PCA:
-                n_aso = min(EMBEDDING_PCA_DIMS, X_embed_raw.shape[1],
+                pca_dims = EMBEDDING_PCA_DIMS[ds_key]
+                n_aso = min(pca_dims, X_embed_raw.shape[1],
                             X_embed_raw.shape[0])
                 pca_aso = PCA(n_components=n_aso, random_state=RANDOM_STATE)
                 X_embed = pca_aso.fit_transform(X_embed_raw)
@@ -486,7 +490,7 @@ def main():
 
                 ctx_arr = (X_ctx_raw.values if isinstance(X_ctx_raw, pd.DataFrame)
                            else X_ctx_raw)
-                n_ctx = min(EMBEDDING_PCA_DIMS, ctx_arr.shape[1], ctx_arr.shape[0])
+                n_ctx = min(pca_dims, ctx_arr.shape[1], ctx_arr.shape[0])
                 pca_ctx = PCA(n_components=n_ctx, random_state=RANDOM_STATE)
                 X_ctx = pca_ctx.fit_transform(ctx_arr)
                 log(f"    Ctx PCA: {ctx_arr.shape[1]}→{n_ctx} dims, "
