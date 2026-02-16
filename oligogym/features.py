@@ -1300,20 +1300,31 @@ class ModelGeneratorEmbeddings:
                 valid_sequences.append(seq)
                 valid_indices.append(i)
 
+        n_total = len(oligo_list)
+        n_valid = len(valid_sequences)
+        n_failed = n_total - n_valid
+        logger.info(
+            f"ModelGeneratorEmbeddings: {n_valid}/{n_total} sequences valid"
+            f"{f' ({n_failed} failed HELM->FASTA conversion, will be zero vectors)' if n_failed else ''}"
+        )
+
         if not valid_sequences:
-            warnings.warn("No valid sequences to embed")
+            logger.warning("No valid sequences to embed — returning empty array")
             return np.array([])
 
         # Check cache
         cache_file = self._cache_path(valid_sequences)
         if cache_file and os.path.exists(cache_file):
+            logger.info(f"Loading cached embeddings from {cache_file}")
             data = np.load(cache_file)
             valid_embeddings = data["embeddings"]
         else:
+            logger.info(f"Computing embeddings for {n_valid} sequences...")
             valid_embeddings = self._compute_embeddings(valid_sequences)
             if cache_file:
                 os.makedirs(os.path.dirname(cache_file), exist_ok=True)
                 np.savez(cache_file, embeddings=valid_embeddings)
+                logger.info(f"Cached embeddings to {cache_file}")
 
         # Re-insert zeros for invalid sequences
         embedding_dim = valid_embeddings.shape[1]
