@@ -24,6 +24,7 @@ from collections import Counter
 
 import numpy as np
 import pandas as pd
+from sklearn.decomposition import PCA
 from sklearn.model_selection import KFold
 
 # Ensure project root is on the path
@@ -64,6 +65,8 @@ RANDOM_STATE = 42
 RESULTS_DIR = PROJECT_ROOT / "experiments" / "results"
 EMBEDDING_CACHE_DIR = str(PROJECT_ROOT / "experiments" / "embeddings_cache")
 EMBEDDING_BACKBONE = "aido_rna_650m"
+EMBEDDING_PCA = True       # Apply PCA to RNA embeddings (set False to use full dims)
+EMBEDDING_PCA_DIMS = 100   # Number of PCA components when EMBEDDING_PCA is True
 
 # NCBI Entrez config for auto-downloading missing gene transcripts.
 # Set your email here or via the NCBI_EMAIL environment variable.
@@ -338,6 +341,74 @@ def main():
                 f"present in {ref_dir}", report)
 
         # -----------------------------------------------------------------
+        # Audit: per-dataset impact of missing transcripts
+        # -----------------------------------------------------------------
+        log(f"{'='*70}", report)
+        log("  Missing Transcript Audit", report)
+        log(f"{'='*70}", report)
+
+        # Recheck which genes are still missing after download attempt
+        still_missing = set(
+            g for g in all_target_genes
+            if not os.path.isfile(os.path.join(ref_dir, f"{g}.fna"))
+        )
+
+        for ds_key in ASO_DATASET_KEYS:
+            data = datasets[ds_key]
+            targets = data.targets
+            n_total = len(targets)
+
+            # Per-sample: does the target have a transcript file?
+            has_file = [
+                t is not None and not pd.isna(t)
+                and t != "negative_control"
+                and t not in still_missing
+                for t in targets
+            ]
+            n_covered = sum(has_file)
+            n_missing = n_total - n_covered
+
+            log(f"\n  {ds_key}: {n_total} samples", report)
+            log(f"    Samples with transcript:    {n_covered} "
+                f"({n_covered/n_total:.1%})", report)
+            log(f"    Samples WITHOUT transcript: {n_missing} "
+                f"({n_missing/n_total:.1%})", report)
+
+            # Break down by gene: which missing genes affect how many rows
+            if still_missing:
+                gene_counts = Counter(
+                    t for t in targets
+                    if t is not None and not pd.isna(t) and t in still_missing
+                )
+                # Also count negative controls / NaN
+                n_ctrl = sum(
+                    1 for t in targets
+                    if t is None or (isinstance(t, str) and t == "negative_control")
+                    or (not isinstance(t, str) and pd.isna(t))
+                )
+                if n_ctrl:
+                    log(f"    Negative controls / no target: {n_ctrl} samples", report)
+                if gene_counts:
+                    log(f"    Missing genes breakdown:", report)
+                    for gene, cnt in gene_counts.most_common():
+                        log(f"      {gene:20s}: {cnt:5d} samples", report)
+
+            # Y-distribution comparison: covered vs missing
+            y_all = data.y
+            y_covered = y_all[has_file]
+            y_missing = y_all[[not h for h in has_file]]
+            if len(y_covered) > 0 and len(y_missing) > 0:
+                log(f"    Y-distribution (potential bias check):", report)
+                log(f"      Covered   — mean: {y_covered.mean():.3f}, "
+                    f"std: {y_covered.std():.3f}, "
+                    f"median: {np.median(y_covered):.3f}", report)
+                log(f"      Missing   — mean: {y_missing.mean():.3f}, "
+                    f"std: {y_missing.std():.3f}, "
+                    f"median: {np.median(y_missing):.3f}", report)
+
+        log("", report)
+
+        # -----------------------------------------------------------------
         # Compute target features
         # -----------------------------------------------------------------
         log(f"{'='*70}", report)
@@ -374,8 +445,9 @@ def main():
         # -----------------------------------------------------------------
         # Compute RNA embeddings (ASO sequences + target context)
         # -----------------------------------------------------------------
+        pca_label = f", PCA→{EMBEDDING_PCA_DIMS}" if EMBEDDING_PCA else ""
         log(f"{'='*70}", report)
-        log(f"  Computing RNA Embeddings ({EMBEDDING_BACKBONE})", report)
+        log(f"  Computing RNA Embeddings ({EMBEDDING_BACKBONE}{pca_label})", report)
         log(f"{'='*70}", report)
 
         embedder = ModelGeneratorEmbeddings(
@@ -390,9 +462,8 @@ def main():
             log(f"\n  {ds_key}:", report)
 
             # ASO sequence embeddings
-            X_embed = embedder.fit_transform(data.x)
-            dataset_features[(ds_key, "rna_embed")] = pd.DataFrame(X_embed)
-            log(f"    ASO embed:  {X_embed.shape}", report)
+            X_embed_raw = embedder.fit_transform(data.x)
+            log(f"    ASO embed (raw): {X_embed_raw.shape}", report)
 
             # Target context RNA embeddings
             embed_encoder = lambda seqs: embedder.transform(seqs, input_format="fasta")
@@ -400,9 +471,33 @@ def main():
                 reference_dir=ref_dir, context_window=50,
                 encoding=embed_encoder, pooling="mean",
             )
-            X_ctx_embed = tce_embed.fit_transform(data.x, targets=data.targets)
-            dataset_target_feats[ds_key]["CtxEmbed"] = X_ctx_embed
-            log(f"    CtxEmbed:   {X_ctx_embed.shape}", report)
+            X_ctx_raw = tce_embed.fit_transform(data.x, targets=data.targets)
+            log(f"    CtxEmbed (raw):  {X_ctx_raw.shape}", report)
+
+            # Optional per-dataset PCA reduction
+            if EMBEDDING_PCA:
+                n_aso = min(EMBEDDING_PCA_DIMS, X_embed_raw.shape[1],
+                            X_embed_raw.shape[0])
+                pca_aso = PCA(n_components=n_aso, random_state=RANDOM_STATE)
+                X_embed = pca_aso.fit_transform(X_embed_raw)
+                log(f"    ASO PCA: {X_embed_raw.shape[1]}→{n_aso} dims, "
+                    f"explained var: {pca_aso.explained_variance_ratio_.sum():.1%}",
+                    report)
+
+                ctx_arr = (X_ctx_raw.values if isinstance(X_ctx_raw, pd.DataFrame)
+                           else X_ctx_raw)
+                n_ctx = min(EMBEDDING_PCA_DIMS, ctx_arr.shape[1], ctx_arr.shape[0])
+                pca_ctx = PCA(n_components=n_ctx, random_state=RANDOM_STATE)
+                X_ctx = pca_ctx.fit_transform(ctx_arr)
+                log(f"    Ctx PCA: {ctx_arr.shape[1]}→{n_ctx} dims, "
+                    f"explained var: {pca_ctx.explained_variance_ratio_.sum():.1%}",
+                    report)
+
+                dataset_features[(ds_key, "rna_embed")] = pd.DataFrame(X_embed)
+                dataset_target_feats[ds_key]["CtxEmbed"] = pd.DataFrame(X_ctx)
+            else:
+                dataset_features[(ds_key, "rna_embed")] = pd.DataFrame(X_embed_raw)
+                dataset_target_feats[ds_key]["CtxEmbed"] = X_ctx_raw
 
         log("", report)
 
