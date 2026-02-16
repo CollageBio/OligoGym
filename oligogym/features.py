@@ -1,4 +1,5 @@
 import importlib.resources
+import logging
 import os
 import pickle
 import sys
@@ -23,6 +24,14 @@ try:
     RNA_FM_AVAILABLE = True
 except ImportError:
     RNA_FM_AVAILABLE = False
+
+try:
+    from modelgenerator.tasks import Embed as MGEmbed
+    MODELGENERATOR_AVAILABLE = True
+except ImportError:
+    MODELGENERATOR_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
 
 ORDERED_COMPONENTS = ["phosphate", "sugar", "base"]
 DG_RNA = {
@@ -943,7 +952,8 @@ class RNAFMEmbeddings:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
             self.device = torch.device(device)
-        
+        logger.info(f"RNAFMEmbeddings using device: {self.device}")
+
         # Initialize model
         self._load_model()
     
@@ -1063,38 +1073,45 @@ class RNAFMEmbeddings:
         embeddings = self._get_embeddings_batch([fasta_seq])
         return embeddings[0]
     
-    def fit_transform(self, oligo_list: List[str]) -> Union[np.ndarray, pd.DataFrame]:
+    def fit_transform(self, oligo_list: List[str], input_format: str = "helm") -> Union[np.ndarray, pd.DataFrame]:
         """
         Extract RNA-FM embeddings from a list of oligo sequences.
-        
+
         Args:
-            oligo_list (List[str]): List of oligo sequences in HELM notation.
-            flatten (bool, optional): If True, applies pooling and returns DataFrame. 
-                                    If False, returns 3D numpy array. Defaults to False.
-            
+            oligo_list (List[str]): List of oligo sequences in HELM notation
+                (or FASTA/DNA strings when ``input_format="fasta"``).
+            input_format (str): ``"helm"`` (default) or ``"fasta"``. When
+                ``"fasta"``, inputs are treated as raw DNA/RNA strings
+                (T is converted to U automatically).
+
         Returns:
-            Union[np.ndarray, pd.DataFrame]: If flatten=False, returns numpy array with shape 
+            Union[np.ndarray, pd.DataFrame]: If flatten=False, returns numpy array with shape
                                            (n_samples, max_seq_len, embedding_dim).
                                            If flatten=True, returns DataFrame with pooled embeddings.
         """
-        return self.transform(oligo_list)
-    
-    def transform(self, oligo_list: List[str]) -> Union[np.ndarray, pd.DataFrame]:
+        return self.transform(oligo_list, input_format=input_format)
+
+    def transform(self, oligo_list: List[str], input_format: str = "helm") -> Union[np.ndarray, pd.DataFrame]:
         """
         Transform a list of oligo sequences into RNA-FM embeddings.
-        
+
         Args:
-            oligo_list (List[str]): List of oligo sequences in HELM notation.
-            flatten (bool, optional): If True, applies pooling and returns DataFrame. 
-                                    If False, returns 3D numpy array. Defaults to False.
-            
+            oligo_list (List[str]): List of oligo sequences in HELM notation
+                (or FASTA/DNA strings when ``input_format="fasta"``).
+            input_format (str): ``"helm"`` (default) or ``"fasta"``. When
+                ``"fasta"``, inputs are treated as raw DNA/RNA strings
+                (T is converted to U automatically).
+
         Returns:
-            Union[np.ndarray, pd.DataFrame]: If flatten=False, returns numpy array with shape 
+            Union[np.ndarray, pd.DataFrame]: If flatten=False, returns numpy array with shape
                                            (n_samples, max_seq_len, embedding_dim).
                                            If flatten=True, returns DataFrame with pooled embeddings.
         """
-        # Convert HELM to FASTA
-        fasta_sequences = [self._helm_to_fasta(oligo) for oligo in oligo_list]
+        # Convert to FASTA (RNA alphabet)
+        if input_format == "fasta":
+            fasta_sequences = [seq.replace("T", "U") for seq in oligo_list]
+        else:
+            fasta_sequences = [self._helm_to_fasta(oligo) for oligo in oligo_list]
         
         # Filter out empty sequences and keep track of indices
         valid_sequences = []
@@ -1160,6 +1177,152 @@ class RNAFMEmbeddings:
             flanking_length=flanking_length,
             numerical=numerical,
         )
+
+class ModelGeneratorEmbeddings:
+    """
+    Featurizer that extracts pretrained embeddings using modelgenerator backbones.
+
+    Converts HELM notation sequences to FASTA, computes embeddings via a
+    modelgenerator backbone (e.g. aido_rna_650m), and returns pooled
+    fixed-size feature vectors. Supports disk caching to avoid recomputation.
+
+    Args:
+        backbone (str): modelgenerator backbone name. Defaults to "aido_rna_650m".
+        pooling_strategy (str): "mean" or "max". Defaults to "mean".
+        batch_size (int): Batch size for inference. Defaults to 32.
+        device (str): Device for inference. "auto" selects CUDA if available.
+        strands (Optional[List[str]]): HELM strands to consider. Defaults to None.
+        cache_dir (Optional[str]): Directory to cache embeddings. None disables caching.
+    """
+
+    def __init__(
+        self,
+        backbone: str = "aido_rna_650m",
+        pooling_strategy: str = "mean",
+        batch_size: int = 32,
+        device: str = "auto",
+        strands: Optional[List[str]] = None,
+        cache_dir: Optional[str] = None,
+    ):
+        if not MODELGENERATOR_AVAILABLE:
+            raise ImportError(
+                "modelgenerator package is required. "
+                "Install with: pip install modelgenerator"
+            )
+
+        assert pooling_strategy in ["mean", "max"], (
+            "pooling_strategy must be 'mean' or 'max'"
+        )
+
+        self.backbone = backbone
+        self.pooling_strategy = pooling_strategy
+        self.batch_size = batch_size
+        self.strands = strands
+        self.cache_dir = cache_dir
+
+        if device == "auto":
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device)
+        logger.info(f"ModelGeneratorEmbeddings ({backbone}) using device: {self.device}")
+
+        self.model = MGEmbed.from_config({"model.backbone": backbone}).eval()
+        self.model = self.model.to(self.device)
+
+    def _helm_to_fasta(self, oligo_helm: str) -> str:
+        try:
+            monomers = _extract_monomers(oligo_helm, self.strands)
+            monomers["base"] = monomers["base"].replace("EMPTY", "")
+            monomers["base"] = monomers["base"].str[-1]
+            fasta_str = monomers["base"].str.cat()
+            fasta_str = fasta_str.replace("T", "U")
+            return fasta_str
+        except Exception as e:
+            warnings.warn(f"Could not convert HELM to FASTA: {e}")
+            return ""
+
+    def _cache_path(self, sequences: List[str]) -> Optional[str]:
+        if self.cache_dir is None:
+            return None
+        import hashlib
+        key = hashlib.sha256(
+            repr((self.backbone, tuple(sequences))).encode()
+        ).hexdigest()
+        return os.path.join(self.cache_dir, self.backbone, f"{key}.npz")
+
+    def _compute_embeddings(self, sequences: List[str]) -> np.ndarray:
+        all_pooled = []
+        for i in tqdm(range(0, len(sequences), self.batch_size)):
+            batch_seqs = sequences[i : i + self.batch_size]
+            batch = self.model.transform({"sequences": batch_seqs})
+            batch = self.model.transfer_batch_to_device(batch, self.device, 0)
+            with torch.no_grad():
+                out = self.model(batch)
+
+            hidden = out.last_hidden_state  # (B, L, D)
+            mask = out.special_tokens_mask  # (B, L), 1=special
+
+            # mask for real tokens: invert special_tokens_mask
+            real_mask = (mask == 0).unsqueeze(-1).float()  # (B, L, 1)
+
+            if self.pooling_strategy == "mean":
+                pooled = (hidden * real_mask).sum(dim=1) / real_mask.sum(dim=1).clamp(min=1)
+            else:  # max
+                hidden = hidden.masked_fill(real_mask == 0, float("-inf"))
+                pooled = hidden.max(dim=1).values
+
+            all_pooled.append(pooled.cpu().numpy())
+
+        return np.concatenate(all_pooled, axis=0)
+
+    def fit_transform(self, oligo_list: List[str], input_format: str = "helm") -> np.ndarray:
+        return self.transform(oligo_list, input_format=input_format)
+
+    def transform(self, oligo_list: List[str], input_format: str = "helm") -> np.ndarray:
+        """Transform oligo sequences into pooled embeddings.
+
+        Args:
+            oligo_list: HELM strings, or FASTA/DNA strings when
+                ``input_format="fasta"``.
+            input_format: ``"helm"`` (default) or ``"fasta"``. When
+                ``"fasta"``, inputs are treated as raw DNA/RNA strings
+                (T is converted to U automatically).
+        """
+        if input_format == "fasta":
+            fasta_sequences = [seq.replace("T", "U") for seq in oligo_list]
+        else:
+            fasta_sequences = [self._helm_to_fasta(oligo) for oligo in oligo_list]
+
+        valid_sequences = []
+        valid_indices = []
+        for i, seq in enumerate(fasta_sequences):
+            if seq:
+                valid_sequences.append(seq)
+                valid_indices.append(i)
+
+        if not valid_sequences:
+            warnings.warn("No valid sequences to embed")
+            return np.array([])
+
+        # Check cache
+        cache_file = self._cache_path(valid_sequences)
+        if cache_file and os.path.exists(cache_file):
+            data = np.load(cache_file)
+            valid_embeddings = data["embeddings"]
+        else:
+            valid_embeddings = self._compute_embeddings(valid_sequences)
+            if cache_file:
+                os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+                np.savez(cache_file, embeddings=valid_embeddings)
+
+        # Re-insert zeros for invalid sequences
+        embedding_dim = valid_embeddings.shape[1]
+        result = np.zeros((len(oligo_list), embedding_dim))
+        for idx, valid_idx in enumerate(valid_indices):
+            result[valid_idx] = valid_embeddings[idx]
+
+        return result
+
 
 class HELMGraph:
     """
