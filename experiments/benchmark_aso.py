@@ -66,10 +66,11 @@ RESULTS_DIR = PROJECT_ROOT / "experiments" / "results"
 EMBEDDING_CACHE_DIR = str(PROJECT_ROOT / "experiments" / "embeddings_cache")
 EMBEDDING_BACKBONE = "aido_rna_650m"
 EMBEDDING_PCA = True       # Apply PCA to RNA embeddings (set False to use full dims)
-EMBEDDING_PCA_DIMS = {     # Per-dataset PCA components when EMBEDDING_PCA is True
-    "OpenASO": 128,
-    "ASOptimizer": 256,
+EMBEDDING_PCA_DIMS = {     # Per-dataset PCA component options when EMBEDDING_PCA is True
+    "OpenASO": [100, 128],
+    "ASOptimizer": [256, 512],
 }
+CONTEXT_WINDOWS = [25, 50, 100]  # Target context window sizes (nt) to sweep
 
 # NCBI Entrez config for auto-downloading missing gene transcripts.
 # Set your email here or via the NCBI_EMAIL environment variable.
@@ -109,16 +110,8 @@ BEST_CONFIGS = {
     ("ASOptimizer",  "XGB"):      ("kmer_123_mod",   {"task": "regression", "n_estimators": 100,  "max_depth": 10}),
 }
 
-VARIANT_NAMES = [
-    "Baseline", "+ TF", "+ CtxKmer", "+ CtxEmbed",
-    "+ TF + CtxKmer", "+ TF + CtxEmbed",
-]
 
-EMBED_VARIANT_NAMES = [
-    "Embed", "Embed + TF", "Embed + CtxKmer", "Embed + CtxEmbed",
-]
 
-ALL_VARIANT_NAMES = VARIANT_NAMES + EMBED_VARIANT_NAMES
 
 
 # =============================================================================
@@ -412,12 +405,14 @@ def main():
         log("", report)
 
         # -----------------------------------------------------------------
-        # Compute target features
+        # Compute target features (TF once; CtxKmer per window)
         # -----------------------------------------------------------------
         log(f"{'='*70}", report)
-        log("  Computing Target Gene Features", report)
+        log(f"  Computing Target Gene Features (windows: {CONTEXT_WINDOWS})", report)
         log(f"{'='*70}", report)
 
+        # dataset_target_feats[ds_key] = {"TF": ..., "coverage": ...,
+        #     "CtxKmer": {window: df, ...}}
         dataset_target_feats = {}
 
         for ds_key in ASO_DATASET_KEYS:
@@ -430,27 +425,33 @@ def main():
             coverage = X_tf["has_target_info"].mean()
             log(f"    TF:      {X_tf.shape}, coverage: {coverage:.1%}", report)
 
-            tce_kmer = TargetContextEncoder(
-                reference_dir=ref_dir, context_window=50,
-                encoding="kmer", encoding_k=[1, 2, 3], pooling="mean",
-            )
-            X_ctx_kmer = tce_kmer.fit_transform(data.x, targets=data.targets)
-            log(f"    CtxKmer: {X_ctx_kmer.shape}", report)
+            ctx_kmer_by_window = {}
+            for w in CONTEXT_WINDOWS:
+                tce_kmer = TargetContextEncoder(
+                    reference_dir=ref_dir, context_window=w,
+                    encoding="kmer", encoding_k=[1, 2, 3], pooling="mean",
+                )
+                X_ctx_kmer = tce_kmer.fit_transform(data.x, targets=data.targets)
+                ctx_kmer_by_window[w] = X_ctx_kmer
+                log(f"    CtxKmer (w={w:3d}): {X_ctx_kmer.shape}", report)
 
             dataset_target_feats[ds_key] = {
                 "TF": X_tf.fillna(-1),
-                "CtxKmer": X_ctx_kmer,
+                "CtxKmer": ctx_kmer_by_window,
                 "coverage": coverage,
             }
 
         log("", report)
 
         # -----------------------------------------------------------------
-        # Compute RNA embeddings (ASO sequences + target context)
+        # Compute RNA embeddings (ASO sequences + target context per window)
+        # Then apply PCA for each (dataset, window, pca_dim) combination.
         # -----------------------------------------------------------------
-        pca_label = (f", PCA→{EMBEDDING_PCA_DIMS}") if EMBEDDING_PCA else ""
         log(f"{'='*70}", report)
-        log(f"  Computing RNA Embeddings ({EMBEDDING_BACKBONE}{pca_label})", report)
+        log(f"  Computing RNA Embeddings ({EMBEDDING_BACKBONE})", report)
+        log(f"  Context windows: {CONTEXT_WINDOWS}", report)
+        if EMBEDDING_PCA:
+            log(f"  PCA dims: {EMBEDDING_PCA_DIMS}", report)
         log(f"{'='*70}", report)
 
         embedder = ModelGeneratorEmbeddings(
@@ -460,274 +461,284 @@ def main():
             cache_dir=EMBEDDING_CACHE_DIR,
         )
 
+        # Storage:
+        #   aso_embed_pca[(ds_key, pca_dim)] = DataFrame   (or "raw" key when PCA off)
+        #   ctx_embed_pca[(ds_key, window, pca_dim)] = DataFrame
+        aso_embed_pca = {}
+        ctx_embed_pca = {}
+
         for ds_key in ASO_DATASET_KEYS:
             data = datasets[ds_key]
+            pca_dim_list = EMBEDDING_PCA_DIMS[ds_key] if EMBEDDING_PCA else ["raw"]
             log(f"\n  {ds_key}:", report)
 
-            # ASO sequence embeddings
+            # ASO sequence embeddings (computed once, PCA'd per dim)
             X_embed_raw = embedder.fit_transform(data.x)
             log(f"    ASO embed (raw): {X_embed_raw.shape}", report)
 
-            # Target context RNA embeddings
-            embed_encoder = lambda seqs: embedder.transform(seqs, input_format="fasta")
-            tce_embed = TargetContextEncoder(
-                reference_dir=ref_dir, context_window=50,
-                encoding=embed_encoder, pooling="mean",
-            )
-            X_ctx_raw = tce_embed.fit_transform(data.x, targets=data.targets)
-            log(f"    CtxEmbed (raw):  {X_ctx_raw.shape}", report)
-
-            # Optional per-dataset PCA reduction
             if EMBEDDING_PCA:
-                pca_dims = EMBEDDING_PCA_DIMS[ds_key]
-                n_aso = min(pca_dims, X_embed_raw.shape[1],
-                            X_embed_raw.shape[0])
-                pca_aso = PCA(n_components=n_aso, random_state=RANDOM_STATE)
-                X_embed = pca_aso.fit_transform(X_embed_raw)
-                log(f"    ASO PCA: {X_embed_raw.shape[1]}→{n_aso} dims, "
-                    f"explained var: {pca_aso.explained_variance_ratio_.sum():.1%}",
-                    report)
-
-                ctx_arr = (X_ctx_raw.values if isinstance(X_ctx_raw, pd.DataFrame)
-                           else X_ctx_raw)
-                n_ctx = min(pca_dims, ctx_arr.shape[1], ctx_arr.shape[0])
-                pca_ctx = PCA(n_components=n_ctx, random_state=RANDOM_STATE)
-                X_ctx = pca_ctx.fit_transform(ctx_arr)
-                log(f"    Ctx PCA: {ctx_arr.shape[1]}→{n_ctx} dims, "
-                    f"explained var: {pca_ctx.explained_variance_ratio_.sum():.1%}",
-                    report)
-
-                dataset_features[(ds_key, "rna_embed")] = pd.DataFrame(X_embed)
-                dataset_target_feats[ds_key]["CtxEmbed"] = pd.DataFrame(X_ctx)
+                for pdim in pca_dim_list:
+                    n_aso = min(pdim, X_embed_raw.shape[1], X_embed_raw.shape[0])
+                    pca_aso = PCA(n_components=n_aso, random_state=RANDOM_STATE)
+                    X_aso_pca = pca_aso.fit_transform(X_embed_raw)
+                    aso_embed_pca[(ds_key, pdim)] = pd.DataFrame(X_aso_pca)
+                    log(f"    ASO PCA (d={pdim}): {X_embed_raw.shape[1]}→{n_aso}, "
+                        f"explained var: "
+                        f"{pca_aso.explained_variance_ratio_.sum():.1%}", report)
             else:
-                dataset_features[(ds_key, "rna_embed")] = pd.DataFrame(X_embed_raw)
-                dataset_target_feats[ds_key]["CtxEmbed"] = X_ctx_raw
+                aso_embed_pca[(ds_key, "raw")] = pd.DataFrame(X_embed_raw)
+
+            # Context embeddings: compute raw per window, then PCA per dim
+            embed_encoder = lambda seqs: embedder.transform(seqs, input_format="fasta")
+
+            for w in CONTEXT_WINDOWS:
+                tce_embed = TargetContextEncoder(
+                    reference_dir=ref_dir, context_window=w,
+                    encoding=embed_encoder, pooling="mean",
+                )
+                X_ctx_raw = tce_embed.fit_transform(data.x, targets=data.targets)
+                log(f"    CtxEmbed (w={w:3d}, raw): {X_ctx_raw.shape}", report)
+
+                if EMBEDDING_PCA:
+                    ctx_arr = (X_ctx_raw.values if isinstance(X_ctx_raw, pd.DataFrame)
+                               else X_ctx_raw)
+                    for pdim in pca_dim_list:
+                        n_ctx = min(pdim, ctx_arr.shape[1], ctx_arr.shape[0])
+                        pca_ctx = PCA(n_components=n_ctx, random_state=RANDOM_STATE)
+                        X_ctx_pca = pca_ctx.fit_transform(ctx_arr)
+                        ctx_embed_pca[(ds_key, w, pdim)] = pd.DataFrame(X_ctx_pca)
+                        log(f"      PCA (d={pdim}): {ctx_arr.shape[1]}→{n_ctx}, "
+                            f"explained var: "
+                            f"{pca_ctx.explained_variance_ratio_.sum():.1%}", report)
+                else:
+                    ctx_embed_pca[(ds_key, w, "raw")] = (
+                        X_ctx_raw if isinstance(X_ctx_raw, pd.DataFrame)
+                        else pd.DataFrame(X_ctx_raw))
 
         log("", report)
 
         # -----------------------------------------------------------------
-        # Phase 2: Target feature experiments
+        # Phase 2 & 3: Run ALL (window, pca_dim) combos
         # -----------------------------------------------------------------
         log(f"{'='*70}", report)
-        log("  PHASE 2: Target Feature Experiments", report)
+        log("  PHASE 2 & 3: Target Feature + Embedding Experiments", report)
+        log(f"  Sweeping context_window × PCA dims", report)
         log(f"{'='*70}", report)
 
-        all_results = {}
-        target_rows = []
+        all_results = {}   # key: (ds_key, model, variant_label) → (mean, std)
+        all_rows = []      # flat list for CSV export
 
         for ds_key in ASO_DATASET_KEYS:
             data = datasets[ds_key]
             y_all = data.y
             tf_data = dataset_target_feats[ds_key]
             X_tf = tf_data["TF"]
-            X_ctx_kmer = tf_data["CtxKmer"]
-            X_ctx_embed = tf_data["CtxEmbed"]
+            pca_dim_list = EMBEDDING_PCA_DIMS[ds_key] if EMBEDDING_PCA else ["raw"]
 
-            log(f"\n  {ds_key} (coverage: {tf_data['coverage']:.1%})", report)
-            log(f"  {'-'*50}", report)
+            log(f"\n{'='*60}", report)
+            log(f"  {ds_key} (coverage: {tf_data['coverage']:.1%})", report)
+            log(f"{'='*60}", report)
 
             for model_name in MODELS_TO_RUN:
                 feat_key, model_kwargs = BEST_CONFIGS[(ds_key, model_name)]
                 X_base = dataset_features[(ds_key, feat_key)]
                 model_class = MODEL_CLASSES[model_name]
 
-                variants = {
-                    "Baseline":       X_base,
-                    "+ TF":           combine_features(X_base, X_tf),
-                    "+ CtxKmer":      combine_features(X_base, X_ctx_kmer),
-                    "+ CtxEmbed":     combine_features(X_base, X_ctx_embed),
-                    "+ TF + CtxKmer": combine_features(X_base, X_tf, X_ctx_kmer),
-                    "+ TF + CtxEmbed": combine_features(X_base, X_tf, X_ctx_embed),
-                }
-
-                log(f"\n    {model_name} ({feat_key}):", report)
-                for variant_name, X_feat in variants.items():
-                    mean_pcc, std_pcc = run_cv(model_class, model_kwargs, X_feat, y_all)
-                    all_results[(ds_key, model_name, variant_name)] = (mean_pcc, std_pcc)
-                    marker = " <-- baseline" if variant_name == "Baseline" else ""
-                    log(f"      {variant_name:18s} ({X_feat.shape[1]:4d} feats): "
+                # --- Baseline & +TF (invariant to window/pca) ---
+                for vname, X_feat in [
+                    ("Baseline", X_base),
+                    ("+ TF", combine_features(X_base, X_tf)),
+                ]:
+                    mean_pcc, std_pcc = run_cv(model_class, model_kwargs,
+                                               X_feat, y_all)
+                    label = vname
+                    all_results[(ds_key, model_name, label)] = (mean_pcc, std_pcc)
+                    marker = " <-- baseline" if vname == "Baseline" else ""
+                    log(f"\n    {model_name} | {label:40s} "
+                        f"({X_feat.shape[1]:4d} feats): "
                         f"PCC = {mean_pcc:.3f} +/- {std_pcc:.3f}{marker}", report)
 
                     paper_mean, paper_std = PAPER_RESULTS[ds_key][model_name]
-                    delta = round(mean_pcc - paper_mean, 4)
-                    target_rows.append({
-                        "dataset": ds_key,
-                        "model": model_name,
-                        "variant": variant_name,
-                        "featurizer": feat_key,
+                    all_rows.append({
+                        "dataset": ds_key, "model": model_name,
+                        "variant": label, "featurizer": feat_key,
+                        "context_window": None, "pca_dim": None,
                         "n_features": X_feat.shape[1],
                         "pcc_mean": round(mean_pcc, 4),
                         "pcc_std": round(std_pcc, 4),
                         "paper_pcc_mean": paper_mean,
                         "paper_pcc_std": paper_std,
-                        "delta_vs_paper": delta,
+                        "delta_vs_paper": round(mean_pcc - paper_mean, 4),
                         "target_coverage": round(tf_data["coverage"], 3),
                     })
 
-        df_target = pd.DataFrame(target_rows)
-        df_target.to_csv(target_csv_path, index=False)
-        log(f"\n  Saved {len(df_target)} results to {target_csv_path.name}", report)
+                # --- Sweep over (window, pca_dim) combos ---
+                for w in CONTEXT_WINDOWS:
+                    X_ctx_kmer = tf_data["CtxKmer"][w]
+
+                    # CtxKmer variants (no PCA dependency)
+                    for vname, X_feat in [
+                        (f"+ CtxKmer (w={w})",
+                         combine_features(X_base, X_ctx_kmer)),
+                        (f"+ TF + CtxKmer (w={w})",
+                         combine_features(X_base, X_tf, X_ctx_kmer)),
+                    ]:
+                        if vname in [r[1] for r in all_results
+                                     if r[0] == ds_key]:
+                            continue  # already computed
+                        mean_pcc, std_pcc = run_cv(
+                            model_class, model_kwargs, X_feat, y_all)
+                        all_results[(ds_key, model_name, vname)] = (
+                            mean_pcc, std_pcc)
+                        log(f"    {model_name} | {vname:40s} "
+                            f"({X_feat.shape[1]:4d} feats): "
+                            f"PCC = {mean_pcc:.3f} +/- {std_pcc:.3f}", report)
+
+                        paper_mean, paper_std = PAPER_RESULTS[ds_key][model_name]
+                        all_rows.append({
+                            "dataset": ds_key, "model": model_name,
+                            "variant": vname, "featurizer": feat_key,
+                            "context_window": w, "pca_dim": None,
+                            "n_features": X_feat.shape[1],
+                            "pcc_mean": round(mean_pcc, 4),
+                            "pcc_std": round(std_pcc, 4),
+                            "paper_pcc_mean": paper_mean,
+                            "paper_pcc_std": paper_std,
+                            "delta_vs_paper": round(mean_pcc - paper_mean, 4),
+                            "target_coverage": round(tf_data["coverage"], 3),
+                        })
+
+                    for pdim in pca_dim_list:
+                        X_ctx_embed = ctx_embed_pca[(ds_key, w, pdim)]
+                        X_aso_embed = aso_embed_pca[(ds_key, pdim)]
+                        tag = f"w={w},d={pdim}"
+
+                        # Phase 2 style: base featurizer + context embed
+                        phase2_variants = [
+                            (f"+ CtxEmbed ({tag})",
+                             combine_features(X_base, X_ctx_embed)),
+                            (f"+ TF + CtxEmbed ({tag})",
+                             combine_features(X_base, X_tf, X_ctx_embed)),
+                        ]
+
+                        # Phase 3 style: RNA embed as base featurizer
+                        phase3_variants = [
+                            (f"Embed (d={pdim})",
+                             X_aso_embed),
+                            (f"Embed (d={pdim}) + TF",
+                             combine_features(X_aso_embed, X_tf)),
+                            (f"Embed (d={pdim}) + CtxKmer (w={w})",
+                             combine_features(X_aso_embed, X_ctx_kmer)),
+                            (f"Embed (d={pdim}) + CtxEmbed ({tag})",
+                             combine_features(X_aso_embed, X_ctx_embed)),
+                        ]
+
+                        for vname, X_feat in phase2_variants + phase3_variants:
+                            # Skip if already computed (e.g. Embed(d=X) runs
+                            # once per pdim, not per window)
+                            rkey = (ds_key, model_name, vname)
+                            if rkey in all_results:
+                                continue
+
+                            mean_pcc, std_pcc = run_cv(
+                                model_class, model_kwargs, X_feat, y_all)
+                            all_results[rkey] = (mean_pcc, std_pcc)
+                            log(f"    {model_name} | {vname:40s} "
+                                f"({X_feat.shape[1]:4d} feats): "
+                                f"PCC = {mean_pcc:.3f} +/- {std_pcc:.3f}",
+                                report)
+
+                            paper_mean, paper_std = PAPER_RESULTS[ds_key][
+                                model_name]
+                            featurizer = ("rna_embed" if vname.startswith("Embed")
+                                          else feat_key)
+                            all_rows.append({
+                                "dataset": ds_key, "model": model_name,
+                                "variant": vname, "featurizer": featurizer,
+                                "context_window": w, "pca_dim": pdim,
+                                "n_features": X_feat.shape[1],
+                                "pcc_mean": round(mean_pcc, 4),
+                                "pcc_std": round(std_pcc, 4),
+                                "paper_pcc_mean": paper_mean,
+                                "paper_pcc_std": paper_std,
+                                "delta_vs_paper": round(
+                                    mean_pcc - paper_mean, 4),
+                                "target_coverage": round(
+                                    tf_data["coverage"], 3),
+                            })
+
+        df_all = pd.DataFrame(all_rows)
+        df_all.to_csv(target_csv_path, index=False)
+        log(f"\n  Saved {len(df_all)} results to {target_csv_path.name}", report)
         log("", report)
 
         # -----------------------------------------------------------------
-        # Phase 3: RNA Embeddings as ASO Featurizer
-        # -----------------------------------------------------------------
-        log(f"{'='*70}", report)
-        log(f"  PHASE 3: RNA Embedding as ASO Featurizer ({EMBEDDING_BACKBONE})", report)
-        log(f"{'='*70}", report)
-
-        embed_rows = []
-
-        for ds_key in ASO_DATASET_KEYS:
-            data = datasets[ds_key]
-            y_all = data.y
-            tf_data = dataset_target_feats[ds_key]
-            X_tf = tf_data["TF"]
-            X_ctx_kmer = tf_data["CtxKmer"]
-            X_ctx_embed = tf_data["CtxEmbed"]
-            X_embed = dataset_features[(ds_key, "rna_embed")]
-
-            log(f"\n  {ds_key} (coverage: {tf_data['coverage']:.1%})", report)
-            log(f"  {'-'*50}", report)
-
-            for model_name in MODELS_TO_RUN:
-                _, model_kwargs = BEST_CONFIGS[(ds_key, model_name)]
-                model_class = MODEL_CLASSES[model_name]
-
-                embed_variants = {
-                    "Embed":              X_embed,
-                    "Embed + TF":         combine_features(X_embed, X_tf),
-                    "Embed + CtxKmer":    combine_features(X_embed, X_ctx_kmer),
-                    "Embed + CtxEmbed":   combine_features(X_embed, X_ctx_embed),
-                }
-
-                log(f"\n    {model_name} (rna_embed):", report)
-                for variant_name, X_feat in embed_variants.items():
-                    mean_pcc, std_pcc = run_cv(model_class, model_kwargs, X_feat, y_all)
-                    all_results[(ds_key, model_name, variant_name)] = (mean_pcc, std_pcc)
-                    log(f"      {variant_name:24s} ({X_feat.shape[1]:4d} feats): "
-                        f"PCC = {mean_pcc:.3f} +/- {std_pcc:.3f}", report)
-
-                    paper_mean, paper_std = PAPER_RESULTS[ds_key][model_name]
-                    delta = round(mean_pcc - paper_mean, 4)
-                    embed_rows.append({
-                        "dataset": ds_key,
-                        "model": model_name,
-                        "variant": variant_name,
-                        "featurizer": "rna_embed",
-                        "n_features": X_feat.shape[1],
-                        "pcc_mean": round(mean_pcc, 4),
-                        "pcc_std": round(std_pcc, 4),
-                        "paper_pcc_mean": paper_mean,
-                        "paper_pcc_std": paper_std,
-                        "delta_vs_paper": delta,
-                        "target_coverage": round(tf_data["coverage"], 3),
-                    })
-
-        # Append Phase 3 results to the target features CSV
-        df_embed = pd.DataFrame(embed_rows)
-        df_all_results = pd.concat([df_target, df_embed], ignore_index=True)
-        df_all_results.to_csv(target_csv_path, index=False)
-        log(f"\n  Saved {len(df_all_results)} total results to {target_csv_path.name}", report)
-        log("", report)
-
-        # -----------------------------------------------------------------
-        # Summary tables
+        # Summary
         # -----------------------------------------------------------------
         log(f"{'='*70}", report)
         log("  SUMMARY", report)
         log(f"{'='*70}", report)
 
-        # Per-dataset summary (Phase 2: base featurizer variants)
         for ds_key in ASO_DATASET_KEYS:
+            # Gather all variant keys for this dataset
+            ds_variants = {v for (d, m, v) in all_results if d == ds_key}
+
             log(f"\n  {ds_key} (target coverage: "
                 f"{dataset_target_feats[ds_key]['coverage']:.1%})", report)
-            log(f"  {'Model':8s} | {'Baseline':14s} | {'Best (base feat)':24s} | "
-                f"{'Best PCC':14s} | {'Delta':8s}", report)
-            log(f"  {'-'*80}", report)
+
+            paper_best_model = max(
+                MODELS_TO_RUN, key=lambda m: PAPER_RESULTS[ds_key][m][0])
+            paper_best_mean, paper_best_std = PAPER_RESULTS[ds_key][
+                paper_best_model]
 
             for model_name in MODELS_TO_RUN:
-                baseline_mean = all_results[(ds_key, model_name, "Baseline")][0]
-                baseline_std = all_results[(ds_key, model_name, "Baseline")][1]
+                baseline_mean, baseline_std = all_results[
+                    (ds_key, model_name, "Baseline")]
+
+                # Find best across all variants for this model
+                model_variants = [
+                    v for v in ds_variants
+                    if (ds_key, model_name, v) in all_results
+                ]
                 best_var = max(
-                    VARIANT_NAMES[1:],
+                    model_variants,
                     key=lambda v: all_results[(ds_key, model_name, v)][0],
                 )
-                best_mean, best_std = all_results[(ds_key, model_name, best_var)]
+                best_mean, best_std = all_results[
+                    (ds_key, model_name, best_var)]
                 delta = best_mean - baseline_mean
-                log(f"  {model_name:8s} | {baseline_mean:.3f} +/- {baseline_std:.3f} | "
-                    f"{best_var:24s} | {best_mean:.3f} +/- {best_std:.3f} | "
-                    f"{delta:+.3f}", report)
 
-        # Per-dataset summary (Phase 3: RNA embed variants)
+                log(f"\n    {model_name}:", report)
+                log(f"      Baseline:   {baseline_mean:.3f} +/- "
+                    f"{baseline_std:.3f}  (paper: {PAPER_RESULTS[ds_key][model_name][0]:.2f})",
+                    report)
+                log(f"      Best:       {best_mean:.3f} +/- {best_std:.3f}  "
+                    f"delta={delta:+.3f}  [{best_var}]", report)
+
+            # Overall best across all models
+            all_keys = [
+                (ds_key, m, v)
+                for m in MODELS_TO_RUN for v in ds_variants
+                if (ds_key, m, v) in all_results
+            ]
+            overall_best = max(all_keys, key=lambda k: all_results[k][0])
+            ob_mean, ob_std = all_results[overall_best]
+            log(f"\n    Overall best: {ob_mean:.3f} +/- {ob_std:.3f}  "
+                f"[{overall_best[1]} / {overall_best[2]}]  "
+                f"vs paper best ({paper_best_model} "
+                f"{paper_best_mean:.2f}): {ob_mean - paper_best_mean:+.3f}",
+                report)
+
+        # Top 10 variants across all datasets/models
         log(f"\n  {'='*70}", report)
-        log("  Phase 3 Summary: RNA Embedding as ASO Featurizer", report)
+        log("  Top 10 Configurations (across all datasets × models)", report)
         log(f"  {'='*70}", report)
-
-        for ds_key in ASO_DATASET_KEYS:
-            log(f"\n  {ds_key}", report)
-            log(f"  {'Model':8s} | {'Embed Only':14s} | {'Best Embed Variant':24s} | "
-                f"{'Best PCC':14s} | {'vs Baseline':10s}", report)
-            log(f"  {'-'*80}", report)
-
-            for model_name in MODELS_TO_RUN:
-                baseline_mean = all_results[(ds_key, model_name, "Baseline")][0]
-                embed_mean = all_results[(ds_key, model_name, "Embed")][0]
-                embed_std = all_results[(ds_key, model_name, "Embed")][1]
-                best_var = max(
-                    EMBED_VARIANT_NAMES,
-                    key=lambda v: all_results[(ds_key, model_name, v)][0],
-                )
-                best_mean, best_std = all_results[(ds_key, model_name, best_var)]
-                delta = best_mean - baseline_mean
-                log(f"  {model_name:8s} | {embed_mean:.3f} +/- {embed_std:.3f} | "
-                    f"{best_var:24s} | {best_mean:.3f} +/- {best_std:.3f} | "
-                    f"{delta:+.3f}", report)
-
-        # Overall best comparison (across ALL variants)
-        log(f"\n  {'='*70}", report)
-        log("  Paper vs Our Best (all variants including RNA embeddings)", report)
-        log(f"  {'='*70}", report)
-        log(f"  {'Dataset':15s} | {'Paper Best':22s} | {'Our Baseline':22s} | "
-            f"{'Our Overall Best':32s} | {'Impr':6s}", report)
-        log(f"  {'-'*105}", report)
-
-        for ds_key in ASO_DATASET_KEYS:
-            paper_best_model = max(MODELS_TO_RUN, key=lambda m: PAPER_RESULTS[ds_key][m][0])
-            paper_best_mean, paper_best_std = PAPER_RESULTS[ds_key][paper_best_model]
-
-            bl_best_model = max(MODELS_TO_RUN,
-                                key=lambda m: all_results[(ds_key, m, "Baseline")][0])
-            bl_best_mean, bl_best_std = all_results[(ds_key, bl_best_model, "Baseline")]
-
-            best_key = max(
-                [(ds_key, m, v) for m in MODELS_TO_RUN for v in ALL_VARIANT_NAMES],
-                key=lambda k: all_results[k][0],
-            )
-            best_mean, best_std = all_results[best_key]
-            best_model = best_key[1]
-            best_variant = best_key[2]
-
-            log(f"  {ds_key:15s} | {paper_best_mean:.2f} +/- {paper_best_std:.2f} "
-                f"({paper_best_model:6s}) | {bl_best_mean:.3f} +/- {bl_best_std:.3f} "
-                f"({bl_best_model:6s}) | {best_mean:.3f} +/- {best_std:.3f} "
-                f"({best_model} {best_variant}) | {best_mean - paper_best_mean:+.3f}", report)
-
-        # Variant win counts (across ALL variants)
-        log(f"\n  Best variant wins (across all dataset x model combos):", report)
-        variant_wins = Counter()
-        for ds_key in ASO_DATASET_KEYS:
-            for model_name in MODELS_TO_RUN:
-                best_var = max(
-                    ALL_VARIANT_NAMES,
-                    key=lambda v: all_results[(ds_key, model_name, v)][0],
-                )
-                variant_wins[best_var] += 1
-
-        total = len(ASO_DATASET_KEYS) * len(MODELS_TO_RUN)
-        log(f"  Total combos: {total}", report)
-        for var, count in variant_wins.most_common():
-            log(f"    {var:18s}: {count} wins", report)
+        sorted_keys = sorted(all_results.keys(),
+                             key=lambda k: all_results[k][0], reverse=True)
+        for i, key in enumerate(sorted_keys[:10]):
+            mean, std = all_results[key]
+            log(f"    {i+1:2d}. {mean:.3f} +/- {std:.3f}  "
+                f"{key[0]:15s} {key[1]:6s} {key[2]}", report)
 
         log(f"\n{'='*70}", report)
         log(f"  Done. Results written to {RESULTS_DIR}/", report)
