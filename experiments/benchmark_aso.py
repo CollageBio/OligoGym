@@ -39,6 +39,7 @@ from oligogym.models import (
     CatBoostModel,
 )
 from oligogym.target_features import TargetFeatures, TargetContextEncoder
+from oligogym.download_genes import NCBIGeneDownloader
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format="%(name)s — %(message)s")
@@ -263,13 +264,66 @@ def main():
         log("", report)
 
         # -----------------------------------------------------------------
+        # Check & download missing target gene transcripts
+        # -----------------------------------------------------------------
+        ref_dir = str(PROJECT_ROOT / "data" / "reference_transcripts")
+        os.makedirs(ref_dir, exist_ok=True)
+
+        # Collect all unique target genes across datasets
+        all_target_genes = set()
+        for ds_key in ASO_DATASET_KEYS:
+            data = datasets[ds_key]
+            if data.targets is not None:
+                for t in data.targets:
+                    if t is not None and not pd.isna(t) and t != "negative_control":
+                        all_target_genes.add(t)
+
+        # Find which genes are missing .fna files
+        missing_genes = [
+            g for g in sorted(all_target_genes)
+            if not os.path.isfile(os.path.join(ref_dir, f"{g}.fna"))
+        ]
+
+        if missing_genes:
+            log(f"{'='*70}", report)
+            log(f"  Downloading {len(missing_genes)} Missing Gene Transcript(s)", report)
+            log(f"{'='*70}", report)
+            for g in missing_genes:
+                log(f"    Missing: {g}", report)
+
+            ncbi_email = os.environ.get("NCBI_EMAIL")
+            ncbi_api_key = os.environ.get("NCBI_API_KEY")
+
+            if not ncbi_email:
+                log("  WARNING: NCBI_EMAIL env var not set. "
+                    "Set it to enable automatic gene downloads.", report)
+                log("  Skipping download — target features for missing genes "
+                    "will be NaN.", report)
+            else:
+                downloader_ncbi = NCBIGeneDownloader(
+                    email=ncbi_email,
+                    output_dir=ref_dir,
+                    api_key=ncbi_api_key,
+                )
+                results = downloader_ncbi.process_genes(missing_genes)
+                downloaded = [g for g, p in results.items() if p is not None]
+                failed = [g for g, p in results.items() if p is None]
+                log(f"  Downloaded {len(downloaded)}/{len(missing_genes)} "
+                    f"gene transcript(s)", report)
+                if failed:
+                    log(f"  Failed to download: {', '.join(failed)}", report)
+            log("", report)
+        else:
+            log(f"  All {len(all_target_genes)} target gene transcript files "
+                f"present in {ref_dir}", report)
+
+        # -----------------------------------------------------------------
         # Compute target features
         # -----------------------------------------------------------------
         log(f"{'='*70}", report)
         log("  Computing Target Gene Features", report)
         log(f"{'='*70}", report)
 
-        ref_dir = str(PROJECT_ROOT / "data" / "reference_transcripts")
         dataset_target_feats = {}
 
         for ds_key in ASO_DATASET_KEYS:
