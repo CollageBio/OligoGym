@@ -50,24 +50,56 @@ The following models are currently implemented:
 ## Prerequisites
 
 - Python 3.11+
-- [Poetry](https://python-poetry.org/docs/#installation)
+- [uv](https://docs.astral.sh/uv/getting-started/installation/)
 
 ## Installation
 
-Clone the repository and navigate to the project directory:
+Install uv (if not already installed):
+
+```bash
+# macOS / Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+Clone the repository and install dependencies:
 
 ```bash
 git clone github.com/Roche/oligogym
 cd oligogym
-poetry install
+uv sync
+```
+
+This creates a virtual environment in `.venv/` and installs all dependencies (including dev dependencies) from the lockfile (`uv.lock`).
+
+To install without dev dependencies:
+
+```bash
+uv sync --no-dev
+```
+
+To update the lockfile after changing `pyproject.toml`:
+
+```bash
+uv lock
+uv sync
 ```
 
 ## Usage
 
-Activate the virtual environment:
+Run commands inside the managed virtual environment:
 
 ```bash
-poetry shell
+uv run python your_script.py
+```
+
+Or activate the virtual environment directly:
+
+```bash
+source .venv/bin/activate  # macOS / Linux
+.venv\Scripts\activate     # Windows
 ```
 
 ## Development
@@ -76,7 +108,7 @@ poetry shell
 Format code using Black:
 
 ```bash
-poetry run black oligogym/ tests/
+uv run black oligogym/ tests/
 ```
 
 ### Linting
@@ -84,7 +116,7 @@ poetry run black oligogym/ tests/
 Lint code using Flake8:
 
 ```bash
-poetry run flake8 oligogym/ tests/
+uv run flake8 oligogym/ tests/
 ```
 
 ### Testing
@@ -92,5 +124,13 @@ poetry run flake8 oligogym/ tests/
 Run tests using Pytest:
 
 ```bash
-poetry run pytest
+uv run pytest
+```
+
+### Running Experiments
+
+Run the ASO benchmark experiments:
+
+```bash
+uv run python experiments/benchmark_aso.py
 ```
