@@ -64,11 +64,11 @@ RANDOM_STATE = 42
 
 RESULTS_DIR = PROJECT_ROOT / "experiments" / "results"
 EMBEDDING_CACHE_DIR = str(PROJECT_ROOT / "experiments" / "embeddings_cache")
-EMBEDDING_BACKBONE = "aido_rna_650m"
+EMBEDDING_BACKBONE = "aido_rna_1b600m"
 EMBEDDING_PCA = True       # Apply PCA to RNA embeddings (set False to use full dims)
 EMBEDDING_PCA_DIMS = {     # Per-dataset PCA component options when EMBEDDING_PCA is True
-    "OpenASO": [100, 128],
-    "ASOptimizer": [256, 512],
+    "OpenASO": [128, 256],
+    "ASOptimizer": [256, 512, 768],
 }
 CONTEXT_WINDOWS = [25, 50, 100]  # Target context window sizes (nt) to sweep
 
