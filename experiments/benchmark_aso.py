@@ -67,10 +67,10 @@ EMBEDDING_CACHE_DIR = str(PROJECT_ROOT / "experiments" / "embeddings_cache")
 EMBEDDING_BACKBONE = "aido_rna_1b600m"
 EMBEDDING_PCA = True       # Apply PCA to RNA embeddings (set False to use full dims)
 EMBEDDING_PCA_DIMS = {     # Per-dataset PCA component options when EMBEDDING_PCA is True
-    "OpenASO": [128, 256],
-    "ASOptimizer": [256, 512, 768],
+    "OpenASO": [128],
+    "ASOptimizer": [256, 512],
 }
-CONTEXT_WINDOWS = [25, 50, 100]  # Target context window sizes (nt) to sweep
+CONTEXT_WINDOWS = [50, 100]  # Target context window sizes (nt) to sweep
 
 # NCBI Entrez config for auto-downloading missing gene transcripts.
 # Set your email here or via the NCBI_EMAIL environment variable.
